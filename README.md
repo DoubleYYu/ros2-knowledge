@@ -19,8 +19,9 @@
 11. [自动化测试框架](#11-自动化测试框架)
 12. [性能分析与监控](#12-性能分析与监控)
 13. [数据后处理与可视化](#13-数据后处理与可视化)
-14. [DDS 与通信配置](#14-dds-与通信配置)
-15. [常见数据采集场景速查](#15-常见数据采集场景速查)
+14. 数据清洗
+16. [DDS 与通信配置](#14-dds-与通信配置)
+17. [常见数据采集场景速查](#15-常见数据采集场景速查)
 
 ---
 
@@ -1331,6 +1332,72 @@ if __name__ == '__main__':
 ```
 
 ---
+
+import os
+import cv2
+import numpy as np
+import pandas as pd
+from scipy import stats
+from PIL import Image
+
+def robot_multimodal_clean_pipeline(raw_data_dir, output_clean_dir):
+    """
+    机器人多模态传感器数据全流程清洗流水线
+    :param raw_data_dir: 原始采集数据根目录
+    :param output_clean_dir: 清洗后数据输出目录
+    """
+    os.makedirs(output_clean_dir, exist_ok=True)
+    # 加载全局同步后的时间戳基准表
+    ts_benchmark = pd.read_csv(os.path.join(raw_data_dir, "global_timestamp.csv"))
+    clean_result = []
+
+    # 1. 视觉图像数据清洗
+    img_raw_dir = os.path.join(raw_data_dir, "camera")
+    img_output_dir = os.path.join(output_clean_dir, "camera")
+    os.makedirs(img_output_dir, exist_ok=True)
+    for img_file in os.listdir(img_raw_dir):
+        img_path = os.path.join(img_raw_dir, img_file)
+        try:
+            # 校验图像完整性，剔除损坏文件
+            img = cv2.imread(img_path)
+            if img is None or img.shape[0] < 256 or img.shape[1] < 256:
+                continue
+            # 统一分辨率，过滤过暗过曝的无效帧
+            gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            brightness = np.mean(gray_img)
+            if brightness < 30 or brightness > 225:
+                continue
+            # 输出标准化图像
+            cv2.imwrite(os.path.join(img_output_dir, img_file), cv2.resize(img, (640, 480)))
+            clean_result.append({"type":"camera", "file":img_file, "status":"valid"})
+        except Exception as e:
+            print(f"图像清洗跳过无效文件: {img_file}")
+
+    # 2. IMU时序数据清洗
+    imu_raw = pd.read_csv(os.path.join(raw_data_dir, "imu_raw.csv"))
+    # Z-score算法过滤加速度、角速度异常跳点
+    imu_zscore = np.abs(stats.zscore(imu_raw[["acc_x","acc_y","acc_z","gyro_x","gyro_y","gyro_z"]]))
+    imu_clean = imu_raw[(imu_zscore < 3).all(axis=1)]
+    # 对齐全局时间戳基准
+    imu_clean["timestamp"] = pd.to_numeric(imu_clean["timestamp"])
+    imu_aligned = pd.merge_asof(imu_clean, ts_benchmark, on="timestamp")
+    imu_aligned.to_csv(os.path.join(output_clean_dir, "imu_clean.csv"), index=False)
+
+    # 3. 跨模态一致性校验
+    static_mask = imu_clean["acc_z"].between(9.7, 9.9)
+    static_img_list = [f for f in os.listdir(img_output_dir) if int(f.split(".")[0]) in imu_clean[static_mask]["timestamp"].values]
+    for static_img in static_img_list:
+        img = cv2.imread(os.path.join(img_output_dir, static_img))
+        feature_detect = cv2.goodFeaturesToTrack(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), maxCorners=100, qualityLevel=0.01, minDistance=10)
+        # 静止状态下特征点过少判定为模糊帧，直接剔除
+        if feature_detect is None or len(feature_detect) < 20:
+            os.remove(os.path.join(img_output_dir, static_img))
+
+    print("机器人多模态传感器数据清洗完成，有效数据占比: {:.2f}%".format(len(clean_result)/os.listdir(img_raw_dir).__len__()*100))
+
+# 调用示例
+if __name__ == "__main__":
+    robot_multimodal_clean_pipeline("./robot_raw_data_20260703", "./robot_clean_data_output")
 
 ## 14. DDS 与通信配置
 
